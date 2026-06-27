@@ -19,6 +19,17 @@ from .selfplay import play_one_game
 DEFAULT_CHECKPOINT_DIR = Path(__file__).resolve().parents[2] / "checkpoints"
 
 
+def _auto_device() -> str:
+    # Note: we deliberately do NOT auto-select Apple MPS. For the default small
+    # network, per-call host<->GPU transfer overhead during self-play makes MPS
+    # several times slower than CPU end-to-end. MPS/CUDA only pay off once the
+    # network is large enough and the MCTS batch size high enough that compute
+    # dominates transfer -- pass --device mps (or cuda) explicitly then.
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
 def train(
     iterations: int = 50,
     games_per_iteration: int = 20,
@@ -27,11 +38,12 @@ def train(
     batch_size: int = 256,
     train_steps_per_iteration: int = 200,
     lr: float = 1e-3,
+    mcts_batch_size: int = 16,
     checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR,
     device: str | None = None,
     resume: str | None = None,
 ):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or _auto_device()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     network = QuoridorNet().to(device)
@@ -54,7 +66,10 @@ def train(
             leave=False,
         )
         for _ in selfplay_bar:
-            examples, winner = play_one_game(network, device=device, num_simulations=num_simulations)
+            examples, winner = play_one_game(
+                network, device=device, num_simulations=num_simulations,
+                mcts_batch_size=mcts_batch_size,
+            )
             buffer.extend(examples)
             results[winner] += 1
             selfplay_bar.set_postfix(P0=results[0], P1=results[1], draw=results[-1], buffer=len(buffer))
@@ -108,11 +123,13 @@ def main():
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--games-per-iteration", type=int, default=20)
     parser.add_argument("--num-simulations", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=256, help="SGD training batch size")
     parser.add_argument("--train-steps-per-iteration", type=int, default=200)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--mcts-batch-size", type=int, default=16,
+                        help="MCTS leaf-evaluation batch size (helps most on GPU/MPS)")
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--device", type=str, default=None, help="cpu, cuda, or mps (auto if unset)")
     args = parser.parse_args()
 
     train(
@@ -122,6 +139,7 @@ def main():
         batch_size=args.batch_size,
         train_steps_per_iteration=args.train_steps_per_iteration,
         lr=args.lr,
+        mcts_batch_size=args.mcts_batch_size,
         resume=args.resume,
         device=args.device,
     )

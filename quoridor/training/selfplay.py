@@ -12,10 +12,10 @@ MAX_MOVES = 200
 TEMPERATURE_MOVES = 20  # after this many plies, play greedily (temperature -> 0)
 
 
-def play_one_game(network, device="cpu", num_simulations: int = 200):
+def play_one_game(network, device="cpu", num_simulations: int = 200, mcts_batch_size: int = 16):
     """Returns a list of (planes, policy, player) tuples and the winner."""
     state = State.initial()
-    mcts = MCTS(network, device=device, num_simulations=num_simulations)
+    mcts = MCTS(network, device=device, num_simulations=num_simulations, batch_size=mcts_batch_size)
     examples = []
 
     for ply in range(MAX_MOVES):

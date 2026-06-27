@@ -39,36 +39,54 @@ class Node:
 
 class MCTS:
     def __init__(self, network, device="cpu", num_simulations: int = 200,
-                 dirichlet_alpha: float = 0.3, dirichlet_eps: float = 0.25):
+                 dirichlet_alpha: float = 0.3, dirichlet_eps: float = 0.25,
+                 batch_size: int = 16, virtual_loss: float = 1.0):
         self.network = network
         self.device = device
         self.num_simulations = num_simulations
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_eps = dirichlet_eps
+        # Leaf-parallel batching: collect up to `batch_size` leaves (guided away
+        # from each other by a temporary virtual loss) and evaluate them in a
+        # single network forward pass.
+        self.batch_size = max(1, batch_size)
+        self.virtual_loss = virtual_loss
 
-    def _evaluate(self, state: State):
-        """Returns (canonical_policy_probs over real actions, value, mask).
-
-        The legal-action mask is the single most expensive thing to compute
-        (it path-checks every candidate wall), so we return it here and reuse
-        it in _expand rather than recomputing it.
-        """
-        planes = torch.from_numpy(encode_state(state)).to(self.device)
-        probs, value = self.network.predict(planes)
-        probs = probs.cpu().numpy()
+    def _mask_probs(self, state: State, probs: np.ndarray):
+        """Map network policy (canonical action space) onto a normalized
+        distribution over this state's real legal actions; return (probs, mask)."""
         mask = legal_action_mask(state)
-        # probs are indexed in canonical (possibly flipped) action space;
-        # remap each to the corresponding real action index.
         real_probs = np.zeros(ACTION_SIZE, dtype=np.float32)
         for a in np.nonzero(mask)[0]:
-            canon_a = encode_action_for_player(state, int(a))
-            real_probs[a] = probs[canon_a]
+            real_probs[a] = probs[encode_action_for_player(state, int(a))]
         total = real_probs.sum()
         if total > 0:
             real_probs /= total
         else:
             real_probs = mask / max(mask.sum(), 1)
+        return real_probs, mask
+
+    def _evaluate(self, state: State):
+        """Single-state evaluation. Returns (real_probs, value, mask)."""
+        planes = torch.from_numpy(encode_state(state)).to(self.device)
+        probs, value = self.network.predict(planes)
+        real_probs, mask = self._mask_probs(state, probs.cpu().numpy())
         return real_probs, value, mask
+
+    def _evaluate_batch(self, states: list):
+        """Evaluate several states in one network forward pass.
+
+        Returns a list of (real_probs, value, mask) aligned with `states`."""
+        planes = np.stack([encode_state(s) for s in states])
+        tensor = torch.from_numpy(planes).to(self.device)
+        probs, values = self.network.predict(tensor)
+        probs = probs.cpu().numpy()
+        values = values.cpu().numpy()
+        results = []
+        for i, state in enumerate(states):
+            real_probs, mask = self._mask_probs(state, probs[i])
+            results.append((real_probs, float(values[i]), mask))
+        return results
 
     def run(self, root_state: State, add_noise: bool = True) -> "Node":
         root = Node(root_state.clone())
@@ -76,24 +94,64 @@ class MCTS:
         self._expand(root, priors, mask)
         if add_noise:
             self._add_dirichlet_noise(root)
+        if not root.children:
+            return root
 
-        for _ in range(self.num_simulations):
-            node = root
-            path = [node]
-            while node.expanded() and not node.state.is_terminal():
-                action, node = self._select_child(node)
-                path.append(node)
+        sims_done = 0
+        while sims_done < self.num_simulations:
+            leaves, paths = [], []
+            pending = set()
+            target = min(self.batch_size, self.num_simulations - sims_done)
+            # Gather a batch of distinct, non-terminal leaves to evaluate.
+            while len(leaves) < target:
+                node = root
+                path = [node]
+                while node.expanded() and not node.state.is_terminal():
+                    _, node = self._select_child(node)
+                    path.append(node)
+                leaf = path[-1]
+                if leaf.state.is_terminal():
+                    winner = leaf.state.winner
+                    value = 1.0 if winner == leaf.player else -1.0
+                    self._backpropagate(path, value)
+                    sims_done += 1
+                    if sims_done >= self.num_simulations:
+                        break
+                    continue
+                if id(leaf) in pending:
+                    # Collision: virtual loss didn't steer us away (e.g. only one
+                    # leaf left). Evaluate what we have rather than spin.
+                    break
+                self._apply_virtual_loss(path)
+                pending.add(id(leaf))
+                leaves.append(leaf)
+                paths.append(path)
 
-            leaf = path[-1]
-            if leaf.state.is_terminal():
-                winner = leaf.state.winner
-                value = 1.0 if winner == leaf.player else -1.0
-            else:
-                priors, value, mask = self._evaluate(leaf.state)
+            if not leaves:
+                continue
+
+            for (priors, value, mask), leaf, path in zip(
+                self._evaluate_batch([leaf.state for leaf in leaves]), leaves, paths
+            ):
+                self._revert_virtual_loss(path)
                 self._expand(leaf, priors, mask)
-
-            self._backpropagate(path, value)
+                self._backpropagate(path, value)
+                sims_done += 1
         return root
+
+    def _apply_virtual_loss(self, path: list) -> None:
+        # Temporarily count each node on the path as a loss so concurrent
+        # selections in this batch are discouraged from re-walking it.
+        vl = self.virtual_loss
+        for node in path:
+            node.visit_count += vl
+            node.value_sum -= vl
+
+    def _revert_virtual_loss(self, path: list) -> None:
+        vl = self.virtual_loss
+        for node in path:
+            node.visit_count -= vl
+            node.value_sum += vl
 
     def _select_child(self, node: Node):
         best_score, best_action, best_child = -float("inf"), None, None
