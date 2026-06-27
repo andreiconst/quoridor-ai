@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm, trange
 
 from .network import QuoridorNet
 from .selfplay import play_one_game
@@ -41,20 +42,35 @@ def train(
     optimizer = torch.optim.Adam(network.parameters(), lr=lr, weight_decay=1e-4)
     buffer = deque(maxlen=buffer_size)
 
-    for it in range(1, iterations + 1):
+    iteration_bar = trange(1, iterations + 1, desc="Training", unit="iter")
+    for it in iteration_bar:
         network.eval()
         t0 = time.time()
         results = {0: 0, 1: 0, -1: 0}
-        for _ in range(games_per_iteration):
+        selfplay_bar = tqdm(
+            range(games_per_iteration),
+            desc=f"iter {it} self-play",
+            unit="game",
+            leave=False,
+        )
+        for _ in selfplay_bar:
             examples, winner = play_one_game(network, device=device, num_simulations=num_simulations)
             buffer.extend(examples)
             results[winner] += 1
+            selfplay_bar.set_postfix(P0=results[0], P1=results[1], draw=results[-1], buffer=len(buffer))
+        selfplay_bar.close()
         gen_time = time.time() - t0
 
         network.train()
         losses = []
         if len(buffer) >= batch_size:
-            for _ in range(train_steps_per_iteration):
+            train_bar = tqdm(
+                range(train_steps_per_iteration),
+                desc=f"iter {it} train",
+                unit="step",
+                leave=False,
+            )
+            for _ in train_bar:
                 batch = random.sample(buffer, batch_size)
                 planes = torch.from_numpy(np.stack([b[0] for b in batch])).to(device)
                 target_policy = torch.from_numpy(np.stack([b[1] for b in batch])).to(device)
@@ -69,12 +85,16 @@ def train(
                 loss.backward()
                 optimizer.step()
                 losses.append(loss.item())
+                train_bar.set_postfix(loss=f"{loss.item():.4f}")
+            train_bar.close()
 
         avg_loss = np.mean(losses) if losses else float("nan")
-        print(
+        # tqdm.write keeps the per-iteration summary from clobbering the bars.
+        tqdm.write(
             f"[iter {it}/{iterations}] games: P0={results[0]} P1={results[1]} draw={results[-1]} "
             f"| buffer={len(buffer)} | loss={avg_loss:.4f} | selfplay_time={gen_time:.1f}s"
         )
+        iteration_bar.set_postfix(loss=f"{avg_loss:.4f}", buffer=len(buffer))
 
         ckpt_path = checkpoint_dir / f"model_iter{it}.pt"
         torch.save(network.state_dict(), ckpt_path)

@@ -1,3 +1,6 @@
+import random
+from collections import deque
+
 from quoridor.engine.game import (
     apply_action,
     decode_action,
@@ -5,7 +8,7 @@ from quoridor.engine.game import (
     pawn_action,
     wall_action,
 )
-from quoridor.engine.state import WALL_H, WALL_V, State
+from quoridor.engine.state import EMPTY, WALL_GRID, WALL_H, WALL_V, State
 
 
 def test_initial_pawn_moves():
@@ -94,3 +97,67 @@ def test_wall_placement_decrements_count():
     new_state = apply_action(state, action)
     assert new_state.walls_left[0] == 9
     assert new_state.wall_slots[r][c] == orientation
+
+
+def _brute_path_exists(state, player):
+    start = state.pawns[player]
+    goal = state.goal_row(player)
+    seen = {start}
+    queue = deque([start])
+    while queue:
+        r, c = queue.popleft()
+        if r == goal:
+            return True
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if state._in_bounds(nr, nc) and (nr, nc) not in seen and not state._edge_blocked(r, c, nr, nc):
+                seen.add((nr, nc))
+                queue.append((nr, nc))
+    return False
+
+
+def _brute_legal_walls(state, player):
+    """Reference implementation: full BFS for every candidate wall."""
+    if state.walls_left[player] <= 0:
+        return []
+    legal = []
+    for r in range(WALL_GRID):
+        for c in range(WALL_GRID):
+            if state.wall_slots[r][c] != EMPTY:
+                continue
+            for orientation in (WALL_H, WALL_V):
+                state.wall_slots[r][c] = orientation
+                if _brute_path_exists(state, 0) and _brute_path_exists(state, 1):
+                    legal.append((r, c, orientation))
+                state.wall_slots[r][c] = EMPTY
+    return legal
+
+
+def test_legal_wall_slots_matches_brute_force():
+    """The shortest-path-pruned legal_wall_slots must exactly match a naive
+    full-BFS reference across many random *valid* positions (the game invariant
+    being that both players always have a path to their goal)."""
+    rng = random.Random(12345)
+    tested = 0
+    for _ in range(1500):
+        state = State.initial()
+        for _ in range(rng.randint(0, 20)):
+            r = rng.randint(0, WALL_GRID - 1)
+            c = rng.randint(0, WALL_GRID - 1)
+            o = rng.choice([WALL_H, WALL_V])
+            if state.wall_slots[r][c] == EMPTY:
+                state.wall_slots[r][c] = o
+                if not (_brute_path_exists(state, 0) and _brute_path_exists(state, 1)):
+                    state.wall_slots[r][c] = EMPTY
+        state.pawns = [
+            (rng.randint(0, 8), rng.randint(0, 8)),
+            (rng.randint(0, 8), rng.randint(0, 8)),
+        ]
+        if state.pawns[0] == state.pawns[1]:
+            continue
+        if not (_brute_path_exists(state, 0) and _brute_path_exists(state, 1)):
+            continue
+        tested += 1
+        for pl in (0, 1):
+            assert sorted(state.legal_wall_slots(pl)) == sorted(_brute_legal_walls(state, pl))
+    assert tested > 500  # sanity: we actually exercised plenty of positions

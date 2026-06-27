@@ -42,7 +42,7 @@ pytest tests/ -q
 python -m quoridor.training.train \
   --iterations 50 \
   --games-per-iteration 20 \
-  --num-simulations 100
+  --num-simulations 20
 ```
 
 Each iteration: plays self-play games with MCTS guided by the current

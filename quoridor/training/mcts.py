@@ -47,8 +47,12 @@ class MCTS:
         self.dirichlet_eps = dirichlet_eps
 
     def _evaluate(self, state: State):
-        """Returns (canonical_policy_probs over real actions, value from
-        current player's perspective)."""
+        """Returns (canonical_policy_probs over real actions, value, mask).
+
+        The legal-action mask is the single most expensive thing to compute
+        (it path-checks every candidate wall), so we return it here and reuse
+        it in _expand rather than recomputing it.
+        """
         planes = torch.from_numpy(encode_state(state)).to(self.device)
         probs, value = self.network.predict(planes)
         probs = probs.cpu().numpy()
@@ -64,12 +68,12 @@ class MCTS:
             real_probs /= total
         else:
             real_probs = mask / max(mask.sum(), 1)
-        return real_probs, value
+        return real_probs, value, mask
 
     def run(self, root_state: State, add_noise: bool = True) -> "Node":
         root = Node(root_state.clone())
-        priors, _ = self._evaluate(root.state)
-        self._expand(root, priors)
+        priors, _, mask = self._evaluate(root.state)
+        self._expand(root, priors, mask)
         if add_noise:
             self._add_dirichlet_noise(root)
 
@@ -85,8 +89,8 @@ class MCTS:
                 winner = leaf.state.winner
                 value = 1.0 if winner == leaf.player else -1.0
             else:
-                priors, value = self._evaluate(leaf.state)
-                self._expand(leaf, priors)
+                priors, value, mask = self._evaluate(leaf.state)
+                self._expand(leaf, priors, mask)
 
             self._backpropagate(path, value)
         return root
@@ -102,8 +106,7 @@ class MCTS:
                 best_score, best_action, best_child = score, action, child
         return best_action, best_child
 
-    def _expand(self, node: Node, priors: np.ndarray) -> None:
-        mask = legal_action_mask(node.state)
+    def _expand(self, node: Node, priors: np.ndarray, mask: np.ndarray) -> None:
         legal_actions = np.nonzero(mask)[0]
         for action in legal_actions:
             child_state = apply_action(node.state, int(action))
