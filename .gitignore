@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+checkpoints/
+runs/
+*.pt
+.DS_Store
+.claude/
