@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm, trange
 
+from .dataset import ShardWriter
 from .evaluate import evaluate_vs_baseline
 from .network import QuoridorNet
 from .parallel import generate_games_parallel
@@ -44,14 +45,18 @@ def train(
     workers: int = 1,
     eval_interval: int = 5,
     eval_games: int = 20,
+    channels: int = 64,
+    blocks: int = 6,
+    data_dir: str | None = None,
     checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR,
     device: str | None = None,
     resume: str | None = None,
 ):
     device = device or _auto_device()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    writer = ShardWriter(data_dir) if data_dir else None
 
-    network = QuoridorNet().to(device)
+    network = QuoridorNet(channels=channels, num_blocks=blocks).to(device)
     if resume:
         network.load_state_dict(torch.load(resume, map_location=device))
         print(f"Resumed from {resume}")
@@ -85,6 +90,8 @@ def train(
             )
         for examples, winner in game_results:
             buffer.extend(examples)
+            if writer is not None:
+                writer.add_many(examples)
             results[winner] += 1
             selfplay_bar.update(1)
             selfplay_bar.set_postfix(P0=results[0], P1=results[1], draw=results[-1], buffer=len(buffer))
@@ -129,6 +136,8 @@ def train(
         ckpt_path = checkpoint_dir / f"model_iter{it}.pt"
         torch.save(network.state_dict(), ckpt_path)
         torch.save(network.state_dict(), checkpoint_dir / "latest.pt")
+        if writer is not None:
+            writer.flush()  # persist this iteration's games (crash-safe on spot VMs)
 
         # Periodic strength check against the shortest-path baseline.
         if eval_interval and (it % eval_interval == 0 or it == iterations):
@@ -148,6 +157,8 @@ def train(
                 tqdm.write(f"    new best win_rate={win_rate:.0%} -> saved best.pt")
             iteration_bar.set_postfix(loss=f"{avg_loss:.4f}", win_rate=f"{win_rate:.0%}")
 
+    if writer is not None:
+        writer.close()
     return network
 
 
@@ -167,6 +178,10 @@ def main():
                         help="Evaluate vs baseline every N iterations (0 to disable)")
     parser.add_argument("--eval-games", type=int, default=20,
                         help="Number of arena games per evaluation")
+    parser.add_argument("--channels", type=int, default=64, help="Conv channels (network width)")
+    parser.add_argument("--blocks", type=int, default=6, help="Residual blocks (network depth)")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="If set, save all self-play (state, policy, outcome) examples here")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--device", type=str, default=None, help="cpu, cuda, or mps (auto if unset)")
     args = parser.parse_args()
@@ -182,6 +197,9 @@ def main():
         workers=args.workers,
         eval_interval=args.eval_interval,
         eval_games=args.eval_games,
+        channels=args.channels,
+        blocks=args.blocks,
+        data_dir=args.data_dir,
         resume=args.resume,
         device=args.device,
     )
