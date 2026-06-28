@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 
 import numpy as np
-import torch
 
 from ..engine.game import (
     ACTION_SIZE,
@@ -38,11 +37,16 @@ class Node:
 
 
 class MCTS:
-    def __init__(self, network, device="cpu", num_simulations: int = 200,
+    def __init__(self, network=None, device="cpu", num_simulations: int = 200,
                  dirichlet_alpha: float = 0.3, dirichlet_eps: float = 0.25,
-                 batch_size: int = 16, virtual_loss: float = 1.0):
-        self.network = network
-        self.device = device
+                 batch_size: int = 16, virtual_loss: float = 1.0, evaluator=None):
+        # Evaluation is pluggable: either a local network (LocalEvaluator) or a
+        # RemoteEvaluator that round-trips leaf positions to a central batched
+        # inference server. `MCTS(network, device=...)` still works.
+        if evaluator is None:
+            from .evaluator import LocalEvaluator
+            evaluator = LocalEvaluator(network, device)
+        self.evaluator = evaluator
         self.num_simulations = num_simulations
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_eps = dirichlet_eps
@@ -68,25 +72,60 @@ class MCTS:
 
     def _evaluate(self, state: State):
         """Single-state evaluation. Returns (real_probs, value, mask)."""
-        planes = torch.from_numpy(encode_state(state)).to(self.device)
-        probs, value = self.network.predict(planes)
-        real_probs, mask = self._mask_probs(state, probs.cpu().numpy())
-        return real_probs, value, mask
+        return self._evaluate_batch([state])[0]
 
     def _evaluate_batch(self, states: list):
-        """Evaluate several states in one network forward pass.
+        """Evaluate several states via the (possibly remote) evaluator.
 
         Returns a list of (real_probs, value, mask) aligned with `states`."""
-        planes = np.stack([encode_state(s) for s in states])
-        tensor = torch.from_numpy(planes).to(self.device)
-        probs, values = self.network.predict(tensor)
-        probs = probs.cpu().numpy()
-        values = values.cpu().numpy()
+        planes = np.stack([encode_state(s) for s in states]).astype(np.float32)
+        probs, values = self.evaluator.infer(planes)
         results = []
         for i, state in enumerate(states):
             real_probs, mask = self._mask_probs(state, probs[i])
             results.append((real_probs, float(values[i]), mask))
         return results
+
+    def _collect_leaves(self, root: "Node", remaining: int):
+        """Walk the tree to gather a batch of distinct non-terminal leaves
+        (with virtual loss applied). Terminal leaves are backed up immediately.
+
+        Returns (leaves, paths, terminal_sims)."""
+        leaves, paths = [], []
+        pending = set()
+        terminal_sims = 0
+        target = min(self.batch_size, remaining)
+        while len(leaves) < target:
+            node = root
+            path = [node]
+            while node.expanded() and not node.state.is_terminal():
+                _, node = self._select_child(node)
+                path.append(node)
+            leaf = path[-1]
+            if leaf.state.is_terminal():
+                winner = leaf.state.winner
+                value = 1.0 if winner == leaf.player else -1.0
+                self._backpropagate(path, value)
+                terminal_sims += 1
+                if terminal_sims >= remaining:
+                    break
+                continue
+            if id(leaf) in pending:
+                # Collision: virtual loss didn't steer us away (e.g. only one
+                # leaf left). Evaluate what we have rather than spin.
+                break
+            self._apply_virtual_loss(path)
+            pending.add(id(leaf))
+            leaves.append(leaf)
+            paths.append(path)
+        return leaves, paths, terminal_sims
+
+    def _apply_results(self, results, leaves, paths) -> int:
+        for (priors, value, mask), leaf, path in zip(results, leaves, paths):
+            self._revert_virtual_loss(path)
+            self._expand(leaf, priors, mask)
+            self._backpropagate(path, value)
+        return len(leaves)
 
     def run(self, root_state: State, add_noise: bool = True) -> "Node":
         root = Node(root_state.clone())
@@ -99,59 +138,59 @@ class MCTS:
 
         sims_done = 0
         while sims_done < self.num_simulations:
-            leaves, paths = [], []
-            pending = set()
-            target = min(self.batch_size, self.num_simulations - sims_done)
-            # Gather a batch of distinct, non-terminal leaves to evaluate.
-            while len(leaves) < target:
-                node = root
-                path = [node]
-                while node.expanded() and not node.state.is_terminal():
-                    _, node = self._select_child(node)
-                    path.append(node)
-                leaf = path[-1]
-                if leaf.state.is_terminal():
-                    winner = leaf.state.winner
-                    value = 1.0 if winner == leaf.player else -1.0
-                    self._backpropagate(path, value)
-                    sims_done += 1
-                    if sims_done >= self.num_simulations:
-                        break
-                    continue
-                if id(leaf) in pending:
-                    # Collision: virtual loss didn't steer us away (e.g. only one
-                    # leaf left). Evaluate what we have rather than spin.
-                    break
-                self._apply_virtual_loss(path)
-                pending.add(id(leaf))
-                leaves.append(leaf)
-                paths.append(path)
-
+            leaves, paths, term = self._collect_leaves(root, self.num_simulations - sims_done)
+            sims_done += term
             if not leaves:
                 continue
-
-            for (priors, value, mask), leaf, path in zip(
-                self._evaluate_batch([leaf.state for leaf in leaves]), leaves, paths
-            ):
-                self._revert_virtual_loss(path)
-                self._expand(leaf, priors, mask)
-                self._backpropagate(path, value)
-                sims_done += 1
+            results = self._evaluate_batch([lf.state for lf in leaves])
+            sims_done += self._apply_results(results, leaves, paths)
         return root
 
+    async def run_async(self, root_state: State, async_eval, add_noise: bool = True) -> "Node":
+        """Like run(), but awaits an async (batched) evaluator. Used to run many
+        games concurrently in one event loop so their leaves batch together."""
+        root = Node(root_state.clone())
+        priors, _, mask = (await self._evaluate_batch_async([root.state], async_eval))[0]
+        self._expand(root, priors, mask)
+        if add_noise:
+            self._add_dirichlet_noise(root)
+        if not root.children:
+            return root
+
+        sims_done = 0
+        while sims_done < self.num_simulations:
+            leaves, paths, term = self._collect_leaves(root, self.num_simulations - sims_done)
+            sims_done += term
+            if not leaves:
+                continue
+            results = await self._evaluate_batch_async([lf.state for lf in leaves], async_eval)
+            sims_done += self._apply_results(results, leaves, paths)
+        return root
+
+    async def _evaluate_batch_async(self, states: list, async_eval):
+        planes = np.stack([encode_state(s) for s in states]).astype(np.float32)
+        probs, values = await async_eval.infer(planes)
+        results = []
+        for i, state in enumerate(states):
+            real_probs, mask = self._mask_probs(state, probs[i])
+            results.append((real_probs, float(values[i]), mask))
+        return results
+
     def _apply_virtual_loss(self, path: list) -> None:
-        # Temporarily count each node on the path as a loss so concurrent
-        # selections in this batch are discouraged from re-walking it.
+        # Temporarily discourage re-walking this path within a batch. Selection
+        # uses q = -child.value(), so to make a node *less* attractive to its
+        # parent we push its value UP (looks good for the node's own mover ->
+        # bad for the parent) and add a virtual visit.
         vl = self.virtual_loss
         for node in path:
             node.visit_count += vl
-            node.value_sum -= vl
+            node.value_sum += vl
 
     def _revert_virtual_loss(self, path: list) -> None:
         vl = self.virtual_loss
         for node in path:
             node.visit_count -= vl
-            node.value_sum += vl
+            node.value_sum -= vl
 
     def _select_child(self, node: Node):
         best_score, best_action, best_child = -float("inf"), None, None
