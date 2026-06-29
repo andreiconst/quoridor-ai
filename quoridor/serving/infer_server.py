@@ -50,7 +50,8 @@ class InferenceModel:
     @torch.no_grad()
     def infer(self, planes: np.ndarray):
         self._maybe_reload()
-        tensor = torch.from_numpy(np.ascontiguousarray(planes, dtype=np.float32)).to(self.device)
+        # copy=True yields a writable array (the wire buffer is read-only).
+        tensor = torch.from_numpy(np.array(planes, dtype=np.float32)).to(self.device)
         probs, values = self.net.predict(tensor)
         return probs.cpu().numpy(), values.cpu().numpy()
 
