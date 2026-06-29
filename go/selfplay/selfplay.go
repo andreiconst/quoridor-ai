@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/andreiconst/quoridor/data"
 	"github.com/andreiconst/quoridor/engine"
 	"github.com/andreiconst/quoridor/mcts"
 )
@@ -74,8 +75,9 @@ func PlayOneGame(eval mcts.Evaluator, numSims, batchSize int, rng *rand.Rand) ([
 
 // GenerateGames runs nGames across `concurrency` goroutines, all sharing infer
 // (a serving.Batcher) so concurrent tree-walks merge into batched forwards.
-// Returns total examples and a [P0, P1, draw] win tally.
-func GenerateGames(nGames, concurrency, numSims, batchSize int, infer mcts.Infer, seed int64) (int, [3]int) {
+// If writer is non-nil, every example is persisted. Returns total examples and
+// a [P0, P1, draw] win tally.
+func GenerateGames(nGames, concurrency, numSims, batchSize int, infer mcts.Infer, writer *data.ShardWriter, seed int64) (int, [3]int) {
 	var remaining = int64(nGames)
 	var totalExamples int64
 	var tally [3]int64
@@ -90,6 +92,11 @@ func GenerateGames(nGames, concurrency, numSims, batchSize int, infer mcts.Infer
 			for atomic.AddInt64(&remaining, -1) >= 0 {
 				ex, winner := PlayOneGame(eval, numSims, batchSize, rng)
 				atomic.AddInt64(&totalExamples, int64(len(ex)))
+				if writer != nil {
+					for i := range ex {
+						_ = writer.Add(ex[i].Planes, ex[i].Policy, ex[i].Outcome)
+					}
+				}
 				idx := 2
 				if winner == 0 {
 					idx = 0
