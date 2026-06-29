@@ -40,10 +40,14 @@ optimize only what's proven slow.
   adapter). Python learner trains from shards, writes `current.pt`; server
   hot-reloads. End-to-end self-play → train → improve.
 
-## Phase 5 — Validate + benchmark
-- Differential-check Go vs Python self-play on shared seeds.
-- Benchmark games/s; confirm parallel Go tree-walks saturate the GPU (the thing
-  the asyncio version could not).
+## Phase 5 — Validate + benchmark  ✅
+- Engine parity: Go matches Python bit-for-bit on 86 golden states (Phase 2);
+  inference parity: server output == in-process forward (Phase 1). Search-level
+  parity is inherently non-exact (RNG/float/map-order) but bounded by those two
+  component parities plus visit-conservation tests.
+- Benchmark (docs/BENCHMARKS.md): Go self-play + GPU server beats the best
+  Python approach by ~1.5-2.2x, from parallel goroutine tree-walks feeding one
+  batched evaluator. Confirmed the asyncio single-core tree-walk was the ceiling.
 
 ## Transport decision
 Start on a Unix domain socket (Transport A). Swap to shared memory (Transport B)
