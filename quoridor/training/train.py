@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from .dataset import ShardWriter
-from .evaluate import evaluate_vs_baseline
+from .evaluate import evaluate_vs_baseline, evaluate_vs_net
 from .network import QuoridorNet
 from .parallel import generate_games_parallel
 from .selfplay import play_one_game
@@ -47,6 +47,7 @@ def train(
     channels: int = 64,
     blocks: int = 6,
     data_dir: str | None = None,
+    gate_vs: str | None = None,
     checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR,
     device: str | None = None,
     resume: str | None = None,
@@ -59,6 +60,14 @@ def train(
     if resume:
         network.load_state_dict(torch.load(resume, map_location=device))
         print(f"Resumed from {resume}")
+
+    # Frozen reference net for non-saturating self-gating eval (e.g. warm-start).
+    reference_net = None
+    if gate_vs:
+        reference_net = QuoridorNet(channels=channels, num_blocks=blocks).to(device)
+        reference_net.load_state_dict(torch.load(gate_vs, map_location=device))
+        reference_net.eval()
+        print(f"Gating eval vs frozen reference {gate_vs}")
 
     optimizer = torch.optim.Adam(network.parameters(), lr=lr, weight_decay=1e-4)
     buffer = deque(maxlen=buffer_size)
@@ -122,26 +131,34 @@ def train(
         if writer is not None:
             writer.flush()  # persist this iteration's games (crash-safe on spot VMs)
 
-        # Periodic strength check: vs random (easy, shows early progress) and
-        # vs the shortest-path baseline (hard, real strength).
+        # Periodic strength check. shortest-path saturates once the net can
+        # race, so wall_aware is the absolute yardstick and the frozen reference
+        # net (gate) is the non-saturating "better than my past self" signal.
         if eval_interval and (it % eval_interval == 0 or it == iterations):
             network.eval()
-            rw, rd, rl = evaluate_vs_baseline(
-                network, n_games=eval_games, num_simulations=num_simulations,
-                device=device, mcts_batch_size=mcts_batch_size, opponent="random",
-            )
-            sw, sd, sl = evaluate_vs_baseline(
-                network, n_games=eval_games, num_simulations=num_simulations,
-                device=device, mcts_batch_size=mcts_batch_size, opponent="shortest_path",
-            )
-            rand_wr = rw / max(eval_games, 1)
-            sp_wr = sw / max(eval_games, 1)
-            msg = (
-                f"    [eval iter {it}] vs random: {rand_wr:.0%} ({rw}W-{rd}D-{rl}L)  "
-                f"| vs shortest-path: {sp_wr:.0%} ({sw}W-{sd}D-{sl}L)"
-            )
-            if sp_wr > best_win_rate:
-                best_win_rate = sp_wr
+
+            def _wr(opponent):
+                w, d, l = evaluate_vs_baseline(
+                    network, n_games=eval_games, num_simulations=num_simulations,
+                    device=device, mcts_batch_size=mcts_batch_size, opponent=opponent,
+                )
+                return w / max(eval_games, 1), f"{w}W-{d}D-{l}L"
+
+            sp_wr, sp_s = _wr("shortest_path")
+            wa_wr, wa_s = _wr("wall_aware")
+            msg = (f"    [eval iter {it}] vs shortest-path: {sp_wr:.0%} ({sp_s})  "
+                   f"| vs wall-aware: {wa_wr:.0%} ({wa_s})")
+
+            if reference_net is not None:
+                gw, gd, gl = evaluate_vs_net(
+                    network, reference_net, n_games=eval_games,
+                    num_simulations=num_simulations, device=device,
+                    mcts_batch_size=mcts_batch_size,
+                )
+                msg += f"  | vs warm-start: {gw / max(eval_games, 1):.0%} ({gw}W-{gd}D-{gl}L)"
+
+            if wa_wr > best_win_rate:
+                best_win_rate = wa_wr
                 torch.save(network.state_dict(), checkpoint_dir / "best.pt")
                 msg += "  -> new best, saved best.pt"
             print(msg, flush=True)
@@ -171,6 +188,8 @@ def main():
     parser.add_argument("--blocks", type=int, default=6, help="Residual blocks (network depth)")
     parser.add_argument("--data-dir", type=str, default=None,
                         help="If set, save all self-play (state, policy, outcome) examples here")
+    parser.add_argument("--gate-vs", type=str, default=None,
+                        help="Frozen reference checkpoint for self-gating eval (e.g. the warm-start net)")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--device", type=str, default=None, help="cpu, cuda, or mps (auto if unset)")
     args = parser.parse_args()
@@ -189,6 +208,7 @@ def main():
         channels=args.channels,
         blocks=args.blocks,
         data_dir=args.data_dir,
+        gate_vs=args.gate_vs,
         resume=args.resume,
         device=args.device,
     )

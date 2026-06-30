@@ -13,7 +13,7 @@ from collections import deque
 
 import numpy as np
 
-from ..engine.game import apply_action, legal_action_mask, pawn_action
+from ..engine.game import apply_action, legal_action_mask, pawn_action, wall_action
 from ..engine.state import BOARD_SIZE, State
 from .mcts import MCTS
 
@@ -63,7 +63,38 @@ def random_action(state: State) -> int:
     return int(np.random.choice(legal))
 
 
-BASELINES = {"shortest_path": shortest_path_action, "random": random_action}
+def wall_aware_action(state: State) -> int:
+    """Stronger baseline: race toward goal, but when not ahead, place the wall
+    that sets the opponent back the most (net of self-cost). A meaningful
+    absolute yardstick once the net can already race."""
+    player = state.current_player
+    opp = 1 - player
+    own_d = _dist(state, player)
+    opp_d = _dist(state, opp)
+
+    if state.walls_left[player] > 0 and own_d >= opp_d:
+        best_gain, best_wall = 0, None
+        for r, c, orientation in state.legal_wall_slots(player):
+            state.wall_slots[r][c] = orientation
+            gain = (_dist(state, opp) - opp_d) - (_dist(state, player) - own_d)
+            state.wall_slots[r][c] = 0
+            if gain > best_gain:
+                best_gain, best_wall = gain, (r, c, orientation)
+        if best_wall is not None and best_gain >= 1:
+            return wall_action(*best_wall)
+    return shortest_path_action(state)
+
+
+def _dist(state: State, player: int) -> int:
+    d = _distance_to_goal(state, player)
+    return d.get(state.pawns[player], 10**6)
+
+
+BASELINES = {
+    "random": random_action,
+    "shortest_path": shortest_path_action,
+    "wall_aware": wall_aware_action,
+}
 
 
 def mcts_action(mcts: MCTS, state: State) -> int:
@@ -109,6 +140,38 @@ def evaluate_vs_baseline(
             fns, net_player = [base_fn, net_fn], 1
         winner = play_match(fns)
         if winner == net_player:
+            wins += 1
+        elif winner == -1:
+            draws += 1
+        else:
+            losses += 1
+    return wins, draws, losses
+
+
+def evaluate_vs_net(
+    network,
+    opponent,
+    n_games: int = 20,
+    num_simulations: int = 100,
+    device: str = "cpu",
+    mcts_batch_size: int = 16,
+):
+    """Head-to-head arena: `network` vs a frozen `opponent` net, both via MCTS,
+    alternating first move. Returns (wins, draws, losses) for `network`. This is
+    the non-saturating "am I better than my past self" gating metric."""
+    mcts_a = MCTS(network, device=device, num_simulations=num_simulations, batch_size=mcts_batch_size)
+    mcts_b = MCTS(opponent, device=device, num_simulations=num_simulations, batch_size=mcts_batch_size)
+    a_fn = lambda s: mcts_action(mcts_a, s)
+    b_fn = lambda s: mcts_action(mcts_b, s)
+
+    wins = draws = losses = 0
+    for g in range(n_games):
+        if g % 2 == 0:
+            fns, a_player = [a_fn, b_fn], 0
+        else:
+            fns, a_player = [b_fn, a_fn], 1
+        winner = play_match(fns)
+        if winner == a_player:
             wins += 1
         elif winner == -1:
             draws += 1
