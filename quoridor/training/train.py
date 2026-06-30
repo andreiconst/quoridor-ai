@@ -139,23 +139,29 @@ def train(
         if writer is not None:
             writer.flush()  # persist this iteration's games (crash-safe on spot VMs)
 
-        # Periodic strength check against the shortest-path baseline.
+        # Periodic strength check: vs random (easy, shows early progress) and
+        # vs the shortest-path baseline (hard, real strength).
         if eval_interval and (it % eval_interval == 0 or it == iterations):
             network.eval()
-            wins, draws, losses_ = evaluate_vs_baseline(
+            rw, rd, rl = evaluate_vs_baseline(
                 network, n_games=eval_games, num_simulations=num_simulations,
-                device=device, mcts_batch_size=mcts_batch_size,
+                device=device, mcts_batch_size=mcts_batch_size, opponent="random",
             )
-            win_rate = wins / max(eval_games, 1)
+            sw, sd, sl = evaluate_vs_baseline(
+                network, n_games=eval_games, num_simulations=num_simulations,
+                device=device, mcts_batch_size=mcts_batch_size, opponent="shortest_path",
+            )
+            rand_wr = rw / max(eval_games, 1)
+            sp_wr = sw / max(eval_games, 1)
             tqdm.write(
-                f"    [eval iter {it}] vs shortest-path baseline: "
-                f"{wins}W-{draws}D-{losses_}L  win_rate={win_rate:.0%}"
+                f"    [eval iter {it}] vs random: {rand_wr:.0%} ({rw}W-{rd}D-{rl}L)  "
+                f"| vs shortest-path: {sp_wr:.0%} ({sw}W-{sd}D-{sl}L)"
             )
-            if win_rate > best_win_rate:
-                best_win_rate = win_rate
+            if sp_wr > best_win_rate:
+                best_win_rate = sp_wr
                 torch.save(network.state_dict(), checkpoint_dir / "best.pt")
-                tqdm.write(f"    new best win_rate={win_rate:.0%} -> saved best.pt")
-            iteration_bar.set_postfix(loss=f"{avg_loss:.4f}", win_rate=f"{win_rate:.0%}")
+                tqdm.write(f"    new best vs shortest-path={sp_wr:.0%} -> saved best.pt")
+            iteration_bar.set_postfix(loss=f"{avg_loss:.4f}", rand=f"{rand_wr:.0%}", sp=f"{sp_wr:.0%}")
 
     if writer is not None:
         writer.close()

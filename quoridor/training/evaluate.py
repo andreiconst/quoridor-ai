@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from collections import deque
 
+import numpy as np
+
 from ..engine.game import apply_action, legal_action_mask, pawn_action
 from ..engine.state import BOARD_SIZE, State
 from .mcts import MCTS
@@ -54,6 +56,16 @@ def shortest_path_action(state: State) -> int:
     return pawn_action(best_dest)
 
 
+def random_action(state: State) -> int:
+    """Baseline policy: uniformly random legal action (weak; improvement vs this
+    shows up early, before the net can beat the goal-rushing shortest-path bot)."""
+    legal = np.nonzero(legal_action_mask(state))[0]
+    return int(np.random.choice(legal))
+
+
+BASELINES = {"shortest_path": shortest_path_action, "random": random_action}
+
+
 def mcts_action(mcts: MCTS, state: State) -> int:
     """Greedy (temperature 0) action from a network-guided MCTS search."""
     root = mcts.run(state, add_noise=False)
@@ -78,14 +90,16 @@ def evaluate_vs_baseline(
     num_simulations: int = 100,
     device: str = "cpu",
     mcts_batch_size: int = 16,
+    opponent: str = "shortest_path",
 ):
-    """Play the network (via MCTS) against the shortest-path baseline,
-    alternating who moves first. Returns (wins, draws, losses) for the network.
+    """Play the network (via MCTS) against a baseline, alternating who moves
+    first. opponent is "shortest_path" (hard) or "random" (weak). Returns
+    (wins, draws, losses) for the network.
     """
     mcts = MCTS(network, device=device, num_simulations=num_simulations,
                 batch_size=mcts_batch_size)
     net_fn = lambda s: mcts_action(mcts, s)
-    base_fn = lambda s: shortest_path_action(s)
+    base_fn = BASELINES[opponent]
 
     wins = draws = losses = 0
     for g in range(n_games):
