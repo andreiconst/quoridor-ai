@@ -48,6 +48,8 @@ def train(
     blocks: int = 6,
     data_dir: str | None = None,
     gate_vs: str | None = None,
+    anchor_data: str | None = None,
+    anchor_frac: float = 0.25,
     checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR,
     device: str | None = None,
     resume: str | None = None,
@@ -55,6 +57,17 @@ def train(
     device = device or _auto_device()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     writer = ShardWriter(data_dir) if data_dir else None
+
+    # Anchor set (e.g. warm-start racing data) mixed into every batch to prevent
+    # catastrophic forgetting during self-play fine-tuning.
+    anchor_planes = anchor_policies = anchor_values = None
+    n_anchor = 0
+    if anchor_data:
+        from .dataset import load_all
+        anchor_planes, anchor_policies, anchor_values = load_all(anchor_data)
+        n_anchor = int(round(batch_size * anchor_frac))
+        print(f"Anchoring on {anchor_values.shape[0]} examples from {anchor_data} "
+              f"({n_anchor}/{batch_size} per batch)")
 
     network = QuoridorNet(channels=channels, num_blocks=blocks).to(device)
     if resume:
@@ -98,12 +111,23 @@ def train(
 
         network.train()
         losses = []
-        if len(buffer) >= batch_size:
+        n_self = batch_size - n_anchor
+        if len(buffer) >= n_self:
             for _ in range(train_steps_per_iteration):
-                batch = random.sample(buffer, batch_size)
-                planes = torch.from_numpy(np.stack([b[0] for b in batch])).to(device)
-                target_policy = torch.from_numpy(np.stack([b[1] for b in batch])).to(device)
-                target_value = torch.tensor([b[2] for b in batch], dtype=torch.float32, device=device)
+                batch = random.sample(buffer, n_self)
+                planes_np = np.stack([b[0] for b in batch])
+                policy_np = np.stack([b[1] for b in batch])
+                value_np = np.array([b[2] for b in batch], dtype=np.float32)
+                if n_anchor > 0:
+                    # Mix in warm-start examples so racing isn't forgotten while
+                    # self-play teaches walls (anchored fine-tuning).
+                    idx = np.random.randint(0, anchor_planes.shape[0], size=n_anchor)
+                    planes_np = np.concatenate([planes_np, anchor_planes[idx]])
+                    policy_np = np.concatenate([policy_np, anchor_policies[idx]])
+                    value_np = np.concatenate([value_np, anchor_values[idx]])
+                planes = torch.from_numpy(planes_np).to(device)
+                target_policy = torch.from_numpy(policy_np).to(device)
+                target_value = torch.from_numpy(value_np).to(device)
 
                 logits, value = network(planes)
                 policy_loss = -(target_policy * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
@@ -190,6 +214,10 @@ def main():
                         help="If set, save all self-play (state, policy, outcome) examples here")
     parser.add_argument("--gate-vs", type=str, default=None,
                         help="Frozen reference checkpoint for self-gating eval (e.g. the warm-start net)")
+    parser.add_argument("--anchor-data", type=str, default=None,
+                        help="Mix this dataset (e.g. warm-start shards) into every batch to prevent forgetting")
+    parser.add_argument("--anchor-frac", type=float, default=0.25,
+                        help="Fraction of each training batch drawn from the anchor set")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--device", type=str, default=None, help="cpu, cuda, or mps (auto if unset)")
     args = parser.parse_args()
@@ -209,6 +237,8 @@ def main():
         blocks=args.blocks,
         data_dir=args.data_dir,
         gate_vs=args.gate_vs,
+        anchor_data=args.anchor_data,
+        anchor_frac=args.anchor_frac,
         resume=args.resume,
         device=args.device,
     )
