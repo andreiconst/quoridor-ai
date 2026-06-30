@@ -11,7 +11,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm, trange
 
 from .dataset import ShardWriter
 from .evaluate import evaluate_vs_baseline
@@ -65,17 +64,10 @@ def train(
     buffer = deque(maxlen=buffer_size)
     best_win_rate = -1.0
 
-    iteration_bar = trange(1, iterations + 1, desc="Training", unit="iter")
-    for it in iteration_bar:
+    for it in range(1, iterations + 1):
         network.eval()
         t0 = time.time()
         results = {0: 0, 1: 0, -1: 0}
-        selfplay_bar = tqdm(
-            total=games_per_iteration,
-            desc=f"iter {it} self-play",
-            unit="game",
-            leave=False,
-        )
         if workers and workers > 1:
             # Parallel self-play on CPU worker processes.
             game_results = generate_games_parallel(
@@ -93,21 +85,12 @@ def train(
             if writer is not None:
                 writer.add_many(examples)
             results[winner] += 1
-            selfplay_bar.update(1)
-            selfplay_bar.set_postfix(P0=results[0], P1=results[1], draw=results[-1], buffer=len(buffer))
-        selfplay_bar.close()
         gen_time = time.time() - t0
 
         network.train()
         losses = []
         if len(buffer) >= batch_size:
-            train_bar = tqdm(
-                range(train_steps_per_iteration),
-                desc=f"iter {it} train",
-                unit="step",
-                leave=False,
-            )
-            for _ in train_bar:
+            for _ in range(train_steps_per_iteration):
                 batch = random.sample(buffer, batch_size)
                 planes = torch.from_numpy(np.stack([b[0] for b in batch])).to(device)
                 target_policy = torch.from_numpy(np.stack([b[1] for b in batch])).to(device)
@@ -122,16 +105,16 @@ def train(
                 loss.backward()
                 optimizer.step()
                 losses.append(loss.item())
-                train_bar.set_postfix(loss=f"{loss.item():.4f}")
-            train_bar.close()
 
         avg_loss = np.mean(losses) if losses else float("nan")
-        # tqdm.write keeps the per-iteration summary from clobbering the bars.
-        tqdm.write(
+        train_time = time.time() - t0 - gen_time
+        # One concise summary line per iteration.
+        print(
             f"[iter {it}/{iterations}] games: P0={results[0]} P1={results[1]} draw={results[-1]} "
-            f"| buffer={len(buffer)} | loss={avg_loss:.4f} | selfplay_time={gen_time:.1f}s"
+            f"| buffer={len(buffer)} | loss={avg_loss:.4f} "
+            f"| selfplay={gen_time:.1f}s train={train_time:.1f}s",
+            flush=True,
         )
-        iteration_bar.set_postfix(loss=f"{avg_loss:.4f}", buffer=len(buffer))
 
         ckpt_path = checkpoint_dir / f"model_iter{it}.pt"
         torch.save(network.state_dict(), ckpt_path)
@@ -153,15 +136,15 @@ def train(
             )
             rand_wr = rw / max(eval_games, 1)
             sp_wr = sw / max(eval_games, 1)
-            tqdm.write(
+            msg = (
                 f"    [eval iter {it}] vs random: {rand_wr:.0%} ({rw}W-{rd}D-{rl}L)  "
                 f"| vs shortest-path: {sp_wr:.0%} ({sw}W-{sd}D-{sl}L)"
             )
             if sp_wr > best_win_rate:
                 best_win_rate = sp_wr
                 torch.save(network.state_dict(), checkpoint_dir / "best.pt")
-                tqdm.write(f"    new best vs shortest-path={sp_wr:.0%} -> saved best.pt")
-            iteration_bar.set_postfix(loss=f"{avg_loss:.4f}", rand=f"{rand_wr:.0%}", sp=f"{sp_wr:.0%}")
+                msg += "  -> new best, saved best.pt"
+            print(msg, flush=True)
 
     if writer is not None:
         writer.close()
