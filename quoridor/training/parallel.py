@@ -20,16 +20,17 @@ import torch
 _WORKER = {}
 
 
-def _init_worker(state_dict, num_simulations: int, mcts_batch_size: int) -> None:
+def _init_worker(state_dict, num_simulations, mcts_batch_size, channels, blocks, opponent_prob) -> None:
     torch.set_num_threads(1)
     from .network import QuoridorNet
 
-    net = QuoridorNet()
+    net = QuoridorNet(channels=channels, num_blocks=blocks)
     net.load_state_dict(state_dict)
     net.eval()
     _WORKER["net"] = net
     _WORKER["sims"] = num_simulations
     _WORKER["bs"] = mcts_batch_size
+    _WORKER["opp"] = opponent_prob
 
 
 def _play_task(_) -> tuple:
@@ -40,6 +41,7 @@ def _play_task(_) -> tuple:
         device="cpu",
         num_simulations=_WORKER["sims"],
         mcts_batch_size=_WORKER["bs"],
+        opponent_prob=_WORKER["opp"],
     )
 
 
@@ -49,6 +51,9 @@ def generate_games_parallel(
     num_simulations: int,
     mcts_batch_size: int,
     workers: int,
+    channels: int = 64,
+    blocks: int = 6,
+    opponent_prob: float = 0.0,
 ):
     """Yield (examples, winner) tuples as games finish, using `workers`
     processes. Workers always run on CPU (fast for the small net, and avoids
@@ -58,7 +63,7 @@ def generate_games_parallel(
     with ctx.Pool(
         workers,
         initializer=_init_worker,
-        initargs=(cpu_state, num_simulations, mcts_batch_size),
+        initargs=(cpu_state, num_simulations, mcts_batch_size, channels, blocks, opponent_prob),
     ) as pool:
         for result in pool.imap_unordered(_play_task, range(n_games)):
             yield result

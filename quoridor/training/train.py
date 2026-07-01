@@ -50,6 +50,8 @@ def train(
     gate_vs: str | None = None,
     anchor_data: str | None = None,
     anchor_frac: float = 0.25,
+    opponent_prob: float = 0.0,
+    gate_promote: float = 0.6,
     checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR,
     device: str | None = None,
     resume: str | None = None,
@@ -95,11 +97,12 @@ def train(
             game_results = generate_games_parallel(
                 network.state_dict(), games_per_iteration,
                 num_simulations, mcts_batch_size, workers,
+                channels=channels, blocks=blocks, opponent_prob=opponent_prob,
             )
         else:
             game_results = (
                 play_one_game(network, device=device, num_simulations=num_simulations,
-                              mcts_batch_size=mcts_batch_size)
+                              mcts_batch_size=mcts_batch_size, opponent_prob=opponent_prob)
                 for _ in range(games_per_iteration)
             )
         for examples, winner in game_results:
@@ -179,7 +182,15 @@ def train(
                     num_simulations=num_simulations, device=device,
                     mcts_batch_size=mcts_batch_size,
                 )
-                msg += f"  | vs warm-start: {gw / max(eval_games, 1):.0%} ({gw}W-{gd}D-{gl}L)"
+                gate_wr = gw / max(eval_games, 1)
+                msg += f"  | vs gate: {gate_wr:.0%} ({gw}W-{gd}D-{gl}L)"
+                # Advancing gate (Elo ladder): once the net clearly beats the
+                # reference, promote the reference to the current net so the
+                # gate keeps measuring progress instead of saturating.
+                if gate_wr >= gate_promote:
+                    reference_net.load_state_dict(network.state_dict())
+                    torch.save(network.state_dict(), checkpoint_dir / "gate.pt")
+                    msg += " [gate promoted]"
 
             if wa_wr > best_win_rate:
                 best_win_rate = wa_wr
@@ -218,6 +229,10 @@ def main():
                         help="Mix this dataset (e.g. warm-start shards) into every batch to prevent forgetting")
     parser.add_argument("--anchor-frac", type=float, default=0.25,
                         help="Fraction of each training batch drawn from the anchor set")
+    parser.add_argument("--opponent-prob", type=float, default=0.0,
+                        help="Fraction of self-play games vs a heuristic bot (opponent diversity)")
+    parser.add_argument("--gate-promote", type=float, default=0.6,
+                        help="Promote the gate reference once the net's win-rate vs it reaches this")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--device", type=str, default=None, help="cpu, cuda, or mps (auto if unset)")
     args = parser.parse_args()
@@ -239,6 +254,8 @@ def main():
         gate_vs=args.gate_vs,
         anchor_data=args.anchor_data,
         anchor_frac=args.anchor_frac,
+        opponent_prob=args.opponent_prob,
+        gate_promote=args.gate_promote,
         resume=args.resume,
         device=args.device,
     )

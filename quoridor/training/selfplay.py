@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..engine.game import ACTION_SIZE, encode_action_for_player, encode_state, legal_action_mask
+from ..engine.game import (
+    ACTION_SIZE,
+    apply_action,
+    encode_action_for_player,
+    encode_state,
+    legal_action_mask,
+)
 from ..engine.state import State
 from .mcts import MCTS
 
@@ -14,18 +20,34 @@ TEMPERATURE_MOVES = 20  # after this many plies, play greedily (temperature -> 0
 
 
 def play_one_game(network=None, device="cpu", num_simulations: int = 200,
-                  mcts_batch_size: int = 16, evaluator=None):
+                  mcts_batch_size: int = 16, evaluator=None, opponent_prob: float = 0.0):
     """Returns a list of (planes, policy, player) tuples and the winner.
 
-    Pass either a local `network` or a (possibly remote) `evaluator`."""
+    Pass either a local `network` or a (possibly remote) `evaluator`.
+
+    With probability `opponent_prob` the game is a diversity game: one side is a
+    heuristic bot (shortest-path or wall-aware) and only the *net's* moves are
+    recorded as training examples. This forces the net to learn to counter
+    strategies (esp. defensive walls) that pure self-play never generates."""
     state = State.initial()
     mcts = MCTS(network, device=device, num_simulations=num_simulations,
                 batch_size=mcts_batch_size, evaluator=evaluator)
     examples = []
 
+    opp_fn, opp_player = None, -1
+    if opponent_prob > 0 and np.random.random() < opponent_prob:
+        from .evaluate import shortest_path_action, wall_aware_action
+        opp_fn = wall_aware_action if np.random.random() < 0.5 else shortest_path_action
+        opp_player = int(np.random.randint(2))
+
     for ply in range(MAX_MOVES):
         if legal_action_mask(state).sum() == 0:
             break
+        if state.current_player == opp_player:
+            state = apply_action(state, opp_fn(state))  # heuristic move, not recorded
+            if state.is_terminal():
+                break
+            continue
         root = mcts.run(state, add_noise=True)
         temperature = 1.0 if ply < TEMPERATURE_MOVES else 0.1
         policy = MCTS.policy_from_visits(root, temperature=temperature)
