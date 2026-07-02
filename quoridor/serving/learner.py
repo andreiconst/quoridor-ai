@@ -39,11 +39,23 @@ def train_once(
     lr: float = 1e-3,
     resume: str | None = None,
     device: str | None = None,
+    anchor_data: str | None = None,
+    anchor_frac: float = 0.25,
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     planes, policies, values = load_go_dir(data_dir)
     n = len(values)
     print(f"[learner] {n} examples from {data_dir}", flush=True)
+
+    # Anchor set (e.g. warm-start data) mixed into every batch to prevent
+    # catastrophic forgetting during self-play fine-tuning.
+    a_planes = a_policies = a_values = None
+    n_anchor = 0
+    if anchor_data:
+        from ..training.dataset import load_all
+        a_planes, a_policies, a_values = load_all(anchor_data)
+        n_anchor = int(round(batch_size * anchor_frac))
+        print(f"[learner] anchoring on {a_values.shape[0]} examples ({n_anchor}/{batch_size} per batch)", flush=True)
 
     net = QuoridorNet(channels=channels, num_blocks=blocks).to(device)
     if resume and os.path.exists(resume):
@@ -57,11 +69,18 @@ def train_once(
     value_t = torch.from_numpy(values)
 
     losses = []
+    n_self = batch_size - n_anchor
     for _ in range(steps):
-        idx = np.random.randint(0, n, size=min(batch_size, n))
-        x = planes_t[idx].to(device)
-        tp = policy_t[idx].to(device)
-        tv = value_t[idx].to(device)
+        idx = np.random.randint(0, n, size=min(n_self, n))
+        bx, bp, bv = planes_t[idx], policy_t[idx], value_t[idx]
+        if n_anchor > 0:
+            ai = np.random.randint(0, a_planes.shape[0], size=n_anchor)
+            bx = torch.cat([bx, torch.from_numpy(a_planes[ai])])
+            bp = torch.cat([bp, torch.from_numpy(a_policies[ai])])
+            bv = torch.cat([bv, torch.from_numpy(a_values[ai])])
+        x = bx.to(device)
+        tp = bp.to(device)
+        tv = bv.to(device)
         logits, value = net(x)
         policy_loss = -(tp * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
         value_loss = F.mse_loss(value, tv)
@@ -88,10 +107,13 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--resume", default=None)
     p.add_argument("--device", default=None)
+    p.add_argument("--anchor-data", default=None)
+    p.add_argument("--anchor-frac", type=float, default=0.25)
     args = p.parse_args()
     train_once(
         data_dir=args.data_dir, out=args.out, channels=args.channels, blocks=args.blocks,
         steps=args.steps, batch_size=args.batch_size, lr=args.lr, resume=args.resume, device=args.device,
+        anchor_data=args.anchor_data, anchor_frac=args.anchor_frac,
     )
 
 

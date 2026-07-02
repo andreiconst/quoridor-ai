@@ -60,6 +60,16 @@ func PlayOneGame(eval mcts.Evaluator, numSims, batchSize int, rng *rand.Rand) ([
 	}
 
 	winner := state.Winner
+	if winner == -1 {
+		// Move cap reached: resolve by progress (closer pawn wins) so games are
+		// decisive, matching the Python cold-start fix.
+		d0, d1 := state.DistanceToGoal(0), state.DistanceToGoal(1)
+		if d0 < d1 {
+			winner = 0
+		} else if d1 < d0 {
+			winner = 1
+		}
+	}
 	for i := range examples {
 		switch {
 		case winner == -1:

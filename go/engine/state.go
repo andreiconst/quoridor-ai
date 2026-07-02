@@ -182,6 +182,63 @@ func (s *State) pathExists(player int) bool {
 	return false
 }
 
+// DistanceToGoal returns the shortest path length (BFS, respecting walls) from
+// the player's pawn to its goal row, or a large sentinel if unreachable. Used
+// to resolve move-capped self-play games by progress (see Go selfplay).
+func (s *State) DistanceToGoal(player int) int {
+	goal := s.goalRow(player)
+	start := s.Pawns[player].R*BoardSize + s.Pawns[player].C
+	var dist [BoardSize * BoardSize]int
+	for i := range dist {
+		dist[i] = -1
+	}
+	dist[start] = 0
+	queue := []int{start}
+	for qi := 0; qi < len(queue); qi++ {
+		cell := queue[qi]
+		r, c := cell/BoardSize, cell%BoardSize
+		if r == goal {
+			return dist[cell]
+		}
+		d := dist[cell] + 1
+		if r > 0 {
+			rr := r - 1
+			if !((c > 0 && s.WallSlots[rr][c-1] == WallH) || (c < WallGrid && s.WallSlots[rr][c] == WallH)) {
+				if n := cell - BoardSize; dist[n] < 0 {
+					dist[n] = d
+					queue = append(queue, n)
+				}
+			}
+		}
+		if r < BoardSize-1 {
+			if !((c > 0 && s.WallSlots[r][c-1] == WallH) || (c < WallGrid && s.WallSlots[r][c] == WallH)) {
+				if n := cell + BoardSize; dist[n] < 0 {
+					dist[n] = d
+					queue = append(queue, n)
+				}
+			}
+		}
+		if c > 0 {
+			cc := c - 1
+			if !((r > 0 && s.WallSlots[r-1][cc] == WallV) || (r < WallGrid && s.WallSlots[r][cc] == WallV)) {
+				if n := cell - 1; dist[n] < 0 {
+					dist[n] = d
+					queue = append(queue, n)
+				}
+			}
+		}
+		if c < BoardSize-1 {
+			if !((r > 0 && s.WallSlots[r-1][c] == WallV) || (r < WallGrid && s.WallSlots[r][c] == WallV)) {
+				if n := cell + 1; dist[n] < 0 {
+					dist[n] = d
+					queue = append(queue, n)
+				}
+			}
+		}
+	}
+	return 1 << 30
+}
+
 func edgeKey(a, b int) int {
 	if a < b {
 		return a*BoardSize*BoardSize + b
