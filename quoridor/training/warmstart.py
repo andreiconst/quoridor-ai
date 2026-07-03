@@ -32,30 +32,35 @@ from .evaluate import BASELINES
 from .selfplay import MAX_MOVES, _winner_by_progress
 
 
-def play_racing_game(rng, target_fn, explore: float = 0.15, wall_prob: float = 0.06):
-    """One game; target policy = target_fn's move, played move = exploratory."""
+def play_racing_game(rng, target_fn, open_plies: int = 8):
+    """Random opening (for diversity), then DETERMINISTIC target_fn play to the
+    end. Each recorded (tail) state gets policy = target_fn's one-hot move and
+    value = the deterministic playout's outcome from that state -- i.e. "who
+    wins from here under strong play". This gives a clean position-value signal,
+    unlike labeling every state of a noisy game with the final (tempo-decided)
+    outcome, which left the value head near-random (64% sign accuracy)."""
     state = State.initial()
+
+    # Unrecorded random opening for state diversity.
+    for _ in range(int(rng.integers(0, open_plies + 1))):
+        legal = np.nonzero(legal_action_mask(state))[0]
+        if len(legal) == 0:
+            break
+        state = apply_action(state, int(rng.choice(legal)))
+        if state.is_terminal():
+            return []  # opening decided it; nothing clean to learn
+
+    # Deterministic playout; the tail from any state IS the rollout from it.
     examples = []
     for _ in range(MAX_MOVES):
         if legal_action_mask(state).sum() == 0:
             break
         player = state.current_player
-        target = target_fn(state)  # the move to imitate (real action)
+        target = target_fn(state)
         policy = np.zeros(ACTION_SIZE, dtype=np.float32)
         policy[encode_action_for_player(state, target)] = 1.0
         examples.append((encode_state(state), policy, player))
-
-        r = rng.random()
-        if r < wall_prob and state.walls_left[player] > 0:
-            walls = state.legal_wall_slots(player)
-            action = wall_action(*walls[rng.integers(len(walls))]) if walls else target
-        elif r < wall_prob + explore:
-            dests = state.legal_pawn_destinations(player)
-            action = pawn_action(dests[rng.integers(len(dests))])
-        else:
-            action = target
-
-        state = apply_action(state, action)
+        state = apply_action(state, target)
         if state.is_terminal():
             break
 

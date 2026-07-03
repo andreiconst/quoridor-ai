@@ -34,6 +34,7 @@ def pretrain(
     batch_size: int = 512,
     lr: float = 1e-3,
     val_frac: float = 0.05,
+    value_weight: float = 1.0,
     device: str | None = None,
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -74,7 +75,7 @@ def pretrain(
         for start in bar:
             idx = train_idx[start:start + batch_size]
             pl, vl = loss_on(idx)
-            loss = pl + vl
+            loss = pl + value_weight * vl
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -107,12 +108,13 @@ def main():
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--val-frac", type=float, default=0.05)
+    p.add_argument("--value-weight", type=float, default=1.0)
     p.add_argument("--device", type=str, default=None)
     args = p.parse_args()
     pretrain(
         data_dir=args.data_dir, out=args.out, channels=args.channels, blocks=args.blocks,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
-        val_frac=args.val_frac, device=args.device,
+        val_frac=args.val_frac, value_weight=args.value_weight, device=args.device,
     )
 
 
