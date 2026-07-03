@@ -15,7 +15,8 @@ GO=/opt/homebrew/bin/go
 CH=128; BL=10                  # 3M net
 ROUNDS=${1:-60}
 GAMES=150                      # self-play games per round
-SIMS=256                       # deeper search for wall tactics
+SIMS=64                        # sweet spot: value-fixed net has a positive
+                               # improvement operator here (~50% vs wall_aware)
 LEARN_STEPS=300
 EVAL_EVERY=3
 # Schedule: anchor-frac and LR both decay over rounds. Early rounds anchor
@@ -26,8 +27,8 @@ ANCHOR_HI=0.30; ANCHOR_LO=0.05
 LR_HI=3e-4;     LR_LO=7e-5
 SOCK=/tmp/go_loop.sock
 DATA=/tmp/go_loop_data
-ANCHOR=/tmp/qwall             # wall-aware warm-start data (anchor)
-WARM=checkpoints/warm3m.pt
+ANCHOR=/tmp/qwall2            # clean-value wall-aware warm-start data (anchor)
+WARM=checkpoints/warm3m_v2.pt
 
 rm -rf "$DATA"; mkdir -p "$DATA"
 cp "$WARM" checkpoints/current.pt
