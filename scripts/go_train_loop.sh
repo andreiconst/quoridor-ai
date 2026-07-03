@@ -14,10 +14,16 @@ GO=/opt/homebrew/bin/go
 
 CH=128; BL=10                  # 3M net
 ROUNDS=${1:-60}
-GAMES=200                      # self-play games per round
-SIMS=128
+GAMES=150                      # self-play games per round
+SIMS=256                       # deeper search for wall tactics
 LEARN_STEPS=300
 EVAL_EVERY=3
+# Schedule: anchor-frac and LR both decay over rounds. Early rounds anchor
+# hard (protect the warm-start) with a moderate LR; late rounds anchor lightly
+# so self-play data dominates and can push past the teacher, with a low LR to
+# stay stable when the anchor no longer protects it.
+ANCHOR_HI=0.30; ANCHOR_LO=0.05
+LR_HI=3e-4;     LR_LO=7e-5
 SOCK=/tmp/go_loop.sock
 DATA=/tmp/go_loop_data
 ANCHOR=/tmp/qwall             # wall-aware warm-start data (anchor)
@@ -38,13 +44,16 @@ for i in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.2; done
 
 for r in $(seq 1 "$ROUNDS"); do
   t0=$(date +%s)
+  # Linear-decay anchor-frac, exp-decay LR over rounds.
+  FRAC=$(awk "BEGIN{p=($r-1)/($ROUNDS-1); f=$ANCHOR_HI-($ANCHOR_HI-$ANCHOR_LO)*p; printf \"%.3f\", f}")
+  LR=$(awk "BEGIN{p=($r-1)/($ROUNDS-1); l=$LR_HI*exp(log($LR_LO/$LR_HI)*p); printf \"%.7f\", l}")
   /tmp/go_loop_sp --socket "$SOCK" --games $GAMES --concurrency 12 --sims $SIMS \
       --batch 16 --linger-us 1000 --data-dir "$DATA" >/dev/null 2>&1
   $PY -m quoridor.serving.learner --data-dir "$DATA" --out checkpoints/current.pt \
       --channels $CH --blocks $BL --resume checkpoints/current.pt \
-      --anchor-data "$ANCHOR" --anchor-frac 0.25 --steps $LEARN_STEPS --lr 3e-4 \
+      --anchor-data "$ANCHOR" --anchor-frac $FRAC --steps $LEARN_STEPS --lr $LR \
       --device mps 2>&1 | grep -E "trained|anchoring" | tail -1
-  echo "[round $r/$ROUNDS] done in $(( $(date +%s) - t0 ))s"
+  echo "[round $r/$ROUNDS] done in $(( $(date +%s) - t0 ))s (anchor=$FRAC lr=$LR)"
 
   if [ $(( r % EVAL_EVERY )) -eq 0 ]; then
     $PY -c "
