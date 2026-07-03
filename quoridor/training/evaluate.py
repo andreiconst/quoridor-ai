@@ -104,9 +104,25 @@ def mcts_action(mcts: MCTS, state: State) -> int:
     return int(policy.argmax())
 
 
-def play_match(action_fns, max_moves: int = 200) -> int:
-    """Play one game; action_fns[player] -> action int. Returns winner or -1."""
+def random_opening(open_plies: int) -> State:
+    """A start position after up to `open_plies` random legal moves. Diversifies
+    games so deterministic players produce independent outcomes (without this,
+    two deterministic players replay the same game every time)."""
     state = State.initial()
+    k = int(np.random.randint(0, open_plies + 1)) if open_plies > 0 else 0
+    for _ in range(k):
+        legal = np.nonzero(legal_action_mask(state))[0]
+        if len(legal) == 0:
+            break
+        state = apply_action(state, int(np.random.choice(legal)))
+        if state.is_terminal():
+            return State.initial()
+    return state
+
+
+def play_match(action_fns, max_moves: int = 200, start: State | None = None) -> int:
+    """Play one game; action_fns[player] -> action int. Returns winner or -1."""
+    state = start.clone() if start is not None else State.initial()
     for _ in range(max_moves):
         if state.is_terminal() or legal_action_mask(state).sum() == 0:
             break
@@ -122,10 +138,11 @@ def evaluate_vs_baseline(
     device: str = "cpu",
     mcts_batch_size: int = 16,
     opponent: str = "shortest_path",
+    open_plies: int = 6,
 ):
     """Play the network (via MCTS) against a baseline, alternating who moves
-    first. opponent is "shortest_path" (hard) or "random" (weak). Returns
-    (wins, draws, losses) for the network.
+    first, each game from a random opening so results are independent (both
+    players are deterministic). Returns (wins, draws, losses) for the network.
     """
     mcts = MCTS(network, device=device, num_simulations=num_simulations,
                 batch_size=mcts_batch_size)
@@ -138,7 +155,7 @@ def evaluate_vs_baseline(
             fns, net_player = [net_fn, base_fn], 0
         else:
             fns, net_player = [base_fn, net_fn], 1
-        winner = play_match(fns)
+        winner = play_match(fns, start=random_opening(open_plies))
         if winner == net_player:
             wins += 1
         elif winner == -1:
@@ -155,10 +172,11 @@ def evaluate_vs_net(
     num_simulations: int = 100,
     device: str = "cpu",
     mcts_batch_size: int = 16,
+    open_plies: int = 6,
 ):
     """Head-to-head arena: `network` vs a frozen `opponent` net, both via MCTS,
-    alternating first move. Returns (wins, draws, losses) for `network`. This is
-    the non-saturating "am I better than my past self" gating metric."""
+    alternating first move, from random openings. Returns (wins, draws, losses)
+    for `network`. The non-saturating "am I better than my past self" metric."""
     mcts_a = MCTS(network, device=device, num_simulations=num_simulations, batch_size=mcts_batch_size)
     mcts_b = MCTS(opponent, device=device, num_simulations=num_simulations, batch_size=mcts_batch_size)
     a_fn = lambda s: mcts_action(mcts_a, s)
@@ -170,7 +188,7 @@ def evaluate_vs_net(
             fns, a_player = [a_fn, b_fn], 0
         else:
             fns, a_player = [b_fn, a_fn], 1
-        winner = play_match(fns)
+        winner = play_match(fns, start=random_opening(open_plies))
         if winner == a_player:
             wins += 1
         elif winner == -1:
