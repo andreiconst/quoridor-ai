@@ -1,7 +1,7 @@
 # Quorridor
 
 An AlphaZero-style AI for Quoridor (standard 9x9 board, 2 players, 10 walls each),
-written in Python with PyTorch.
+written in Go (also python version) with Inference in Pytorch.
 
 ## Layout
 

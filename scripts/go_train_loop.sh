@@ -9,6 +9,16 @@
 # Everything is env-overridable so the same script runs on a laptop (MPS) or a
 # cloud GPU (CUDA). See docs/GPU_RUNBOOK.md for recommended configs.
 #
+# Crash safety:
+#   * Every round writes the last-completed round number to $STATE_FILE and
+#     (every $SNAPSHOT_EVERY rounds) archives current.pt to $SNAP_DIR/round_N.pt
+#     so a regression can be rolled back.
+#   * On relaunch the loop RESUMES from checkpoints/current.pt at the next round
+#     instead of restarting from $WARM -- so a spot-instance preemption costs at
+#     most one round. Set FRESH=1 to force a clean restart from $WARM.
+#   * Any failed step (self-play, learner, dead inference server) aborts with a
+#     non-zero exit so a supervisor (scripts/train_supervisor.sh) can relaunch.
+#
 #   Usage:  [ENV=...] bash scripts/go_train_loop.sh [rounds]
 set -u
 
@@ -36,8 +46,33 @@ DATA=${DATA:-/tmp/go_loop_data}
 ANCHOR=${ANCHOR:-/tmp/qwall2}                    # warm-start data (anchor)
 WARM=${WARM:-checkpoints/warm3m_v2.pt}           # starting checkpoint
 
-rm -rf "$DATA"; mkdir -p "$DATA"
-cp "$WARM" checkpoints/current.pt
+# --- crash-safety knobs ------------------------------------------------------
+SNAP_DIR=${SNAP_DIR:-checkpoints/snapshots}      # rollback archive + resume state
+STATE_FILE=${STATE_FILE:-$SNAP_DIR/loop_state}   # holds last-completed round number
+SNAPSHOT_EVERY=${SNAPSHOT_EVERY:-10}             # archive current.pt every N rounds
+FRESH=${FRESH:-0}                                # FRESH=1 => ignore prior progress
+mkdir -p "$SNAP_DIR"
+
+# --- resume vs fresh start ---------------------------------------------------
+START_ROUND=1
+if [ "$FRESH" != "1" ] && [ -f "$STATE_FILE" ] && [ -f checkpoints/current.pt ]; then
+  LAST_ROUND=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
+  case "$LAST_ROUND" in ''|*[!0-9]*) LAST_ROUND=0 ;; esac
+  START_ROUND=$(( LAST_ROUND + 1 ))
+  echo "=== RESUME: last completed round=$LAST_ROUND, continuing at round $START_ROUND ==="
+  echo "    (keeping checkpoints/current.pt; set FRESH=1 to restart from $WARM)"
+  mkdir -p "$DATA"                               # keep any accumulated shards
+else
+  echo "=== FRESH start from $WARM ==="
+  rm -rf "$DATA"; mkdir -p "$DATA"
+  cp "$WARM" checkpoints/current.pt
+  echo 0 > "$STATE_FILE"
+fi
+
+if [ "$START_ROUND" -gt "$ROUNDS" ]; then
+  echo "Nothing to do: already completed $ROUNDS rounds. (set FRESH=1 to restart)"
+  echo "GO_LOOP_DONE"; exit 0
+fi
 
 echo "=== build go self-play binary ==="
 (cd go && $GO build -o /tmp/go_loop_sp ./cmd/selfplay) || exit 1
@@ -48,17 +83,47 @@ $PY -m quoridor.serving.infer_server --socket "$SOCK" --checkpoint checkpoints/c
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -f $SOCK' EXIT
 for i in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.2; done
+if [ ! -S "$SOCK" ]; then
+  echo "ERROR: inference server never created $SOCK; see /tmp/go_loop_server.log" >&2
+  tail -20 /tmp/go_loop_server.log >&2; exit 2
+fi
 
-for r in $(seq 1 "$ROUNDS"); do
+for r in $(seq "$START_ROUND" "$ROUNDS"); do
   t0=$(date +%s)
+
+  # Bail if the inference server has died -- the supervisor will relaunch us.
+  if ! kill -0 "$SRV" 2>/dev/null; then
+    echo "[round $r] inference server (pid $SRV) died; see /tmp/go_loop_server.log" >&2
+    tail -20 /tmp/go_loop_server.log >&2; exit 2
+  fi
+
   FRAC=$(awk "BEGIN{p=($r-1)/($ROUNDS-1); f=$ANCHOR_HI-($ANCHOR_HI-$ANCHOR_LO)*p; printf \"%.3f\", f}")
   LR=$(awk "BEGIN{p=($r-1)/($ROUNDS-1); l=$LR_HI*exp(log($LR_LO/$LR_HI)*p); printf \"%.7f\", l}")
-  /tmp/go_loop_sp --socket "$SOCK" --games $GAMES --concurrency $CONCURRENCY --sims $SIMS \
-      --batch 16 --linger-us 1000 --data-dir "$DATA" >/dev/null 2>&1
-  $PY -m quoridor.serving.learner --data-dir "$DATA" --out checkpoints/current.pt \
+
+  # --- self-play (Go actors -> shards) ---
+  if ! /tmp/go_loop_sp --socket "$SOCK" --games $GAMES --concurrency $CONCURRENCY --sims $SIMS \
+      --batch 16 --linger-us 1000 --data-dir "$DATA" > /tmp/go_loop_sp.log 2>&1; then
+    echo "[round $r] SELF-PLAY failed; see /tmp/go_loop_sp.log" >&2
+    tail -20 /tmp/go_loop_sp.log >&2; exit 3
+  fi
+
+  # --- learn (anchored) -> republish current.pt (atomic, hot-reloaded) ---
+  if ! $PY -m quoridor.serving.learner --data-dir "$DATA" --out checkpoints/current.pt \
       --channels $CH --blocks $BL --resume checkpoints/current.pt \
       --anchor-data "$ANCHOR" --anchor-frac $FRAC --steps $LEARN_STEPS --lr $LR \
-      --device "$DEVICE" 2>&1 | grep -E "trained|anchoring" | tail -1
+      --device "$DEVICE" > /tmp/go_loop_learn.log 2>&1; then
+    echo "[round $r] LEARNER failed; see /tmp/go_loop_learn.log" >&2
+    tail -20 /tmp/go_loop_learn.log >&2; exit 4
+  fi
+  grep -E "trained|anchoring" /tmp/go_loop_learn.log | tail -1
+
+  # Round fully completed: record progress (enables resume) and archive.
+  echo "$r" > "$STATE_FILE"
+  if [ $(( r % SNAPSHOT_EVERY )) -eq 0 ]; then
+    cp checkpoints/current.pt "$SNAP_DIR/round_${r}.pt"
+    echo "  [snapshot] $SNAP_DIR/round_${r}.pt"
+  fi
+
   echo "[round $r/$ROUNDS] done in $(( $(date +%s) - t0 ))s (anchor=$FRAC lr=$LR)"
 
   if [ $(( r % EVAL_EVERY )) -eq 0 ]; then
@@ -76,4 +141,7 @@ print('    [eval round $r] '+' | '.join(out))
 "
   fi
 done
+
+# Always archive the final net for easy retrieval / rollback baseline.
+cp checkpoints/current.pt "$SNAP_DIR/round_${ROUNDS}.pt" 2>/dev/null || true
 echo "GO_LOOP_DONE"
