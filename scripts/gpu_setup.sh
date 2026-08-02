@@ -5,7 +5,9 @@
 set -euo pipefail
 
 GO_VERSION=${GO_VERSION:-1.23.4}
-CUDA_TAG=${CUDA_TAG:-cu124}     # match the box's CUDA (cu121/cu124/...); nvidia-smi to check
+CUDA_TAG=${CUDA_TAG:-cu124}     # match the box's GPU; nvidia-smi to check.
+                                # RTX 50-series / Blackwell (sm_120) needs cu128+
+                                # (cu124 installs but has no Blackwell kernels).
 
 # Auto-detect CPU arch so the same script works on x86 (4090/A100/L4) and ARM
 # (GH200/Grace Hopper) boxes. Override with GO_ARCH=... if detection is wrong.
@@ -44,7 +46,21 @@ echo "=== build go self-play binary ==="
 (cd go && go build ./...)
 
 echo "=== sanity checks ==="
-.venv/bin/python -c "import torch; print('cuda available:', torch.cuda.is_available(), '| device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+# Actually run a GPU op -- is_available() can be True while kernels are missing
+# for a newer arch (e.g. Blackwell on a cu124 wheel), which only fails at use.
+.venv/bin/python - <<'PY'
+import sys, torch
+print("torch", torch.__version__, "| cuda available:", torch.cuda.is_available())
+if not torch.cuda.is_available():
+    print("WARNING: no CUDA device visible -- check CUDA_TAG matches the box."); sys.exit(0)
+print("device:", torch.cuda.get_device_name(0))
+try:
+    x = torch.randn(1024, 1024, device="cuda"); (x @ x).sum().item(); torch.cuda.synchronize()
+    print("GPU matmul OK -- wheels match this GPU.")
+except Exception as e:
+    print("GPU OP FAILED -- wheel/arch mismatch. On RTX 50-series retry with "
+          "CUDA_TAG=cu128 bash scripts/gpu_setup.sh\n ", e); sys.exit(1)
+PY
 .venv/bin/python -m pytest tests/ -q 2>&1 | tail -1
 (cd go && go test ./engine/ 2>&1 | tail -1)
 
