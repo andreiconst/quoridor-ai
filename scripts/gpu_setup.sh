@@ -7,6 +7,15 @@ set -euo pipefail
 GO_VERSION=${GO_VERSION:-1.23.4}
 CUDA_TAG=${CUDA_TAG:-cu124}     # match the box's CUDA (cu121/cu124/...); nvidia-smi to check
 
+# Auto-detect CPU arch so the same script works on x86 (4090/A100/L4) and ARM
+# (GH200/Grace Hopper) boxes. Override with GO_ARCH=... if detection is wrong.
+case "$(uname -m)" in
+  x86_64|amd64)          GO_ARCH=${GO_ARCH:-amd64} ;;
+  aarch64|arm64)         GO_ARCH=${GO_ARCH:-arm64} ;;
+  *) echo "unknown arch $(uname -m); set GO_ARCH=amd64|arm64" >&2; GO_ARCH=${GO_ARCH:-amd64} ;;
+esac
+echo "=== arch $(uname -m) -> go $GO_ARCH ==="
+
 echo "=== system deps ==="
 if command -v apt-get >/dev/null; then
   sudo apt-get update -y
@@ -15,14 +24,16 @@ fi
 
 echo "=== Go $GO_VERSION ==="
 if ! command -v go >/dev/null; then
-  wget -q "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
-  sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf "go${GO_VERSION}.linux-amd64.tar.gz"
+  wget -q "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
+  sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf "go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
   export PATH=$PATH:/usr/local/go/bin
   echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
 fi
 go version
 
-echo "=== python venv + CUDA torch ($CUDA_TAG) ==="
+# On ARM (GH200/Grace Hopper) the cu124 index serves aarch64 CUDA wheels; if
+# torch.cuda ends up False below, try CUDA_TAG=cu126 to match a newer driver.
+echo "=== python venv + CUDA torch ($CUDA_TAG, $GO_ARCH) ==="
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -q --upgrade pip
