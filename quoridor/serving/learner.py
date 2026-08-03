@@ -72,6 +72,7 @@ def train_once(
     n_self = batch_size - n_anchor
     for _ in range(steps):
         idx = np.random.randint(0, n, size=min(n_self, n))
+        ns = len(idx)  # actual self-play rows in this batch (may be < n_self early on)
         bx, bp, bv = planes_t[idx], policy_t[idx], value_t[idx]
         if n_anchor > 0:
             ai = np.random.randint(0, a_planes.shape[0], size=n_anchor)
@@ -82,8 +83,13 @@ def train_once(
         tp = bp.to(device)
         tv = bv.to(device)
         logits, value = net(x)
+        # Policy loss on the FULL batch (anchor protects racing skill from being
+        # forgotten). Value loss on the SELF-PLAY rows ONLY: the anchor's value
+        # labels are the wall_aware heuristic's playout outcomes, so training the
+        # value head on them pins it to the heuristic's ~63% ceiling. Decoupling
+        # lets the value head exceed its teacher via real self-play outcomes.
         policy_loss = -(tp * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
-        value_loss = F.mse_loss(value, tv)
+        value_loss = F.mse_loss(value[:ns], tv[:ns])
         loss = policy_loss + value_loss
         opt.zero_grad()
         loss.backward()
