@@ -21,10 +21,11 @@ const (
 // (remapped to the flipped action space, matching encode_state) + outcome from
 // the side-to-move's perspective.
 type Example struct {
-	Planes  []float32
-	Policy  []float32
-	Player  int
-	Outcome float32
+	Planes      []float32
+	Policy      []float32
+	Player      int
+	Outcome     float32
+	SearchValue float32 // MCTS root value at this position (side-to-move perspective)
 }
 
 // PlayOneGame plays a full self-play game and returns its examples + winner.
@@ -50,7 +51,10 @@ func PlayOneGame(eval mcts.Evaluator, numSims, batchSize int, rng *rand.Rand) ([
 				canon[state.EncodeActionForPlayer(a)] = p
 			}
 		}
-		examples = append(examples, Example{Planes: state.EncodeState(), Policy: canon, Player: state.Current})
+		// root.Value() is the MCTS root value from the side-to-move's perspective
+		// (same perspective as Outcome, assigned below) -- a lower-variance value
+		// signal the learner blends with the final outcome.
+		examples = append(examples, Example{Planes: state.EncodeState(), Policy: canon, Player: state.Current, SearchValue: float32(root.Value())})
 
 		a := sampleAction(rng, policy)
 		state = root.Children[a].State
@@ -104,7 +108,7 @@ func GenerateGames(nGames, concurrency, numSims, batchSize int, infer mcts.Infer
 				atomic.AddInt64(&totalExamples, int64(len(ex)))
 				if writer != nil {
 					for i := range ex {
-						_ = writer.Add(ex[i].Planes, ex[i].Policy, ex[i].Outcome)
+						_ = writer.Add(ex[i].Planes, ex[i].Policy, ex[i].Outcome, ex[i].SearchValue)
 					}
 				}
 				idx := 2

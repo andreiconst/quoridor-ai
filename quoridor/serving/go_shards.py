@@ -1,8 +1,8 @@
 """Reader for the Go self-play shard format (see go/data/shard.go).
 
 Format per .qsh file (little-endian):
-    magic u32 (0x51534831) | count u32 | planeSize u32 (486) | actionSize u32 (209)
-    then count records: planes[486] f32 | policy[209] f32 | value f32
+    magic u32 (0x51534832) | count u32 | planeSize u32 (486) | actionSize u32 (209)
+    then count records: planes[486] f32 | policy[209] f32 | value f32 | searchValue f32
 """
 
 from __future__ import annotations
@@ -13,26 +13,27 @@ import struct
 
 import numpy as np
 
-MAGIC = 0x51534831
+MAGIC = 0x51534832  # "QSH2": records carry the MCTS search value after the outcome
 PLANE_SIZE = 486
 ACTION_SIZE = 209
 
 
 def load_go_shard(path):
-    """Returns (planes (N,6,9,9), policies (N,209), values (N,)) float32."""
+    """Returns (planes (N,6,9,9), policies (N,209), values (N,), search_values (N,)) float32."""
     with open(path, "rb") as f:
         raw = f.read()
     magic, count, ps, asz = struct.unpack_from("<IIII", raw, 0)
     if magic != MAGIC:
-        raise ValueError(f"bad magic 0x{magic:08x} in {path}")
+        raise ValueError(f"bad magic 0x{magic:08x} in {path} (stale pre-QSH2 shard? wipe the data dir)")
     if ps != PLANE_SIZE or asz != ACTION_SIZE:
         raise ValueError(f"unexpected sizes ps={ps} asz={asz} in {path}")
-    rec = ps + asz + 1
+    rec = ps + asz + 2  # planes + policy + value + searchValue
     arr = np.frombuffer(raw, dtype="<f4", offset=16, count=count * rec).reshape(count, rec)
     planes = arr[:, :ps].reshape(count, 6, 9, 9).astype(np.float32)
     policies = arr[:, ps:ps + asz].astype(np.float32)
     values = arr[:, ps + asz].astype(np.float32)
-    return planes, policies, values
+    search_values = arr[:, ps + asz + 1].astype(np.float32)
+    return planes, policies, values, search_values
 
 
 def list_go_shards(data_dir):
@@ -40,14 +41,18 @@ def list_go_shards(data_dir):
 
 
 def load_go_dir(data_dir):
-    """Concatenate every Go shard in a directory."""
+    """Concatenate every Go shard in a directory.
+
+    Returns (planes, policies, values, search_values)."""
     shards = list_go_shards(data_dir)
     if not shards:
         raise FileNotFoundError(f"no go_*.qsh shards in {data_dir}")
-    planes, policies, values = [], [], []
+    planes, policies, values, search_values = [], [], [], []
     for path in shards:
-        p, po, v = load_go_shard(path)
+        p, po, v, sv = load_go_shard(path)
         planes.append(p)
         policies.append(po)
         values.append(v)
-    return np.concatenate(planes), np.concatenate(policies), np.concatenate(values)
+        search_values.append(sv)
+    return (np.concatenate(planes), np.concatenate(policies),
+            np.concatenate(values), np.concatenate(search_values))

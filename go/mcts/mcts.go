@@ -38,6 +38,11 @@ func (n *Node) value() float64 {
 	return n.ValueSum / n.VisitCount
 }
 
+// Value is the mean backed-up value at this node, from the node's side-to-move
+// perspective (backprop negates each level, so the root's value matches the
+// root mover's perspective — the same convention as selfplay Example.Outcome).
+func (n *Node) Value() float64 { return n.value() }
+
 func (n *Node) expanded() bool { return len(n.Children) > 0 }
 
 // MCTS holds search configuration.

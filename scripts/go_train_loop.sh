@@ -50,6 +50,8 @@ WARM=${WARM:-checkpoints/warm3m_v2.pt}           # starting checkpoint
 SNAP_DIR=${SNAP_DIR:-checkpoints/snapshots}      # rollback archive + resume state
 STATE_FILE=${STATE_FILE:-$SNAP_DIR/loop_state}   # holds last-completed round number
 SNAPSHOT_EVERY=${SNAPSHOT_EVERY:-10}             # archive current.pt every N rounds
+SHARD_WINDOW=${SHARD_WINDOW:-12}                 # keep this many recent shards (~rounds); bounds disk
+OUTCOME_WEIGHT=${OUTCOME_WEIGHT:-0.6}            # value target = w*outcome + (1-w)*mcts_search_value
 FRESH=${FRESH:-0}                                # FRESH=1 => ignore prior progress
 mkdir -p "$SNAP_DIR"
 
@@ -107,11 +109,15 @@ for r in $(seq "$START_ROUND" "$ROUNDS"); do
     tail -20 /tmp/go_loop_sp.log >&2; exit 3
   fi
 
+  # Bound disk: keep only the newest $SHARD_WINDOW shards (sliding replay window).
+  # Shards are uniquely named per round, so mtime order == creation order.
+  ls -t "$DATA"/go_*.qsh 2>/dev/null | tail -n +$((SHARD_WINDOW + 1)) | xargs -r rm -f
+
   # --- learn (anchored) -> republish current.pt (atomic, hot-reloaded) ---
   if ! $PY -m quoridor.serving.learner --data-dir "$DATA" --out checkpoints/current.pt \
       --channels $CH --blocks $BL --resume checkpoints/current.pt \
       --anchor-data "$ANCHOR" --anchor-frac $FRAC --steps $LEARN_STEPS --lr $LR \
-      --device "$DEVICE" > /tmp/go_loop_learn.log 2>&1; then
+      --outcome-weight $OUTCOME_WEIGHT --device "$DEVICE" > /tmp/go_loop_learn.log 2>&1; then
     echo "[round $r] LEARNER failed; see /tmp/go_loop_learn.log" >&2
     tail -20 /tmp/go_loop_learn.log >&2; exit 4
   fi

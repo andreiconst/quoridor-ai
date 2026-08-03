@@ -41,9 +41,10 @@ def train_once(
     device: str | None = None,
     anchor_data: str | None = None,
     anchor_frac: float = 0.25,
+    outcome_weight: float = 0.6,
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    planes, policies, values = load_go_dir(data_dir)
+    planes, policies, values, search_values = load_go_dir(data_dir)
     n = len(values)
     print(f"[learner] {n} examples from {data_dir}", flush=True)
 
@@ -67,29 +68,32 @@ def train_once(
     planes_t = torch.from_numpy(planes)
     policy_t = torch.from_numpy(policies)
     value_t = torch.from_numpy(values)
+    search_t = torch.from_numpy(search_values)
 
     losses = []
     n_self = batch_size - n_anchor
     for _ in range(steps):
         idx = np.random.randint(0, n, size=min(n_self, n))
         ns = len(idx)  # actual self-play rows in this batch (may be < n_self early on)
-        bx, bp, bv = planes_t[idx], policy_t[idx], value_t[idx]
+        bx, bp = planes_t[idx], policy_t[idx]
+        # Blended value target (lever 2): the final outcome anchors it to ground
+        # truth while the lower-variance MCTS search value sharpens calibration,
+        # so the value scales with search instead of misleading it at high sims.
+        bv = outcome_weight * value_t[idx] + (1.0 - outcome_weight) * search_t[idx]
         if n_anchor > 0:
             ai = np.random.randint(0, a_planes.shape[0], size=n_anchor)
             bx = torch.cat([bx, torch.from_numpy(a_planes[ai])])
             bp = torch.cat([bp, torch.from_numpy(a_policies[ai])])
-            bv = torch.cat([bv, torch.from_numpy(a_values[ai])])
         x = bx.to(device)
         tp = bp.to(device)
         tv = bv.to(device)
         logits, value = net(x)
         # Policy loss on the FULL batch (anchor protects racing skill from being
-        # forgotten). Value loss on the SELF-PLAY rows ONLY: the anchor's value
-        # labels are the wall_aware heuristic's playout outcomes, so training the
-        # value head on them pins it to the heuristic's ~63% ceiling. Decoupling
-        # lets the value head exceed its teacher via real self-play outcomes.
+        # forgotten). Value loss on the SELF-PLAY rows ONLY (lever 1): the anchor's
+        # value labels are the wall_aware heuristic's playout outcomes, and training
+        # the value head on them pins it to the heuristic's ~63% ceiling.
         policy_loss = -(tp * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
-        value_loss = F.mse_loss(value[:ns], tv[:ns])
+        value_loss = F.mse_loss(value[:ns], tv)
         loss = policy_loss + value_loss
         opt.zero_grad()
         loss.backward()
@@ -115,11 +119,13 @@ def main():
     p.add_argument("--device", default=None)
     p.add_argument("--anchor-data", default=None)
     p.add_argument("--anchor-frac", type=float, default=0.25)
+    p.add_argument("--outcome-weight", type=float, default=0.6,
+                   help="value target = w*outcome + (1-w)*mcts_search_value")
     args = p.parse_args()
     train_once(
         data_dir=args.data_dir, out=args.out, channels=args.channels, blocks=args.blocks,
         steps=args.steps, batch_size=args.batch_size, lr=args.lr, resume=args.resume, device=args.device,
-        anchor_data=args.anchor_data, anchor_frac=args.anchor_frac,
+        anchor_data=args.anchor_data, anchor_frac=args.anchor_frac, outcome_weight=args.outcome_weight,
     )
 
 

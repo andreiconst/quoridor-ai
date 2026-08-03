@@ -17,7 +17,7 @@ func TestShardRoundTrip(t *testing.T) {
 		policy := make([]float32, ActionSz)
 		planes[i] = float32(i) + 0.5
 		policy[i] = 1.0
-		if err := w.Add(planes, policy, float32(i)-3); err != nil {
+		if err := w.Add(planes, policy, float32(i)-3, float32(i)+10); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -46,6 +46,9 @@ func TestShardRoundTrip(t *testing.T) {
 			}
 			if got := s.Values[i]; got != float32(global)-3 {
 				t.Fatalf("value[%d] = %v", global, got)
+			}
+			if got := s.SearchValues[i]; got != float32(global)+10 {
+				t.Fatalf("searchValue[%d] = %v", global, got)
 			}
 		}
 		total += s.Count
